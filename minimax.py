@@ -22,8 +22,11 @@ MINIMAX_DEFAULT_MODEL = "MiniMax-M3"
 
 _Q = False
 
-def fail(c, r):
-    print(json.dumps({"ok":False,"err":c,"msg":r}, ensure_ascii=False)); sys.exit(1)
+class MinimaxError(Exception):
+    def __init__(self, code, msg):
+        self.code = code; self.msg = msg; super().__init__(msg)
+
+def fail(c, r): print(json.dumps({"ok":False,"err":c,"msg":r},ensure_ascii=False)); sys.exit(1)
 
 def log(m):
     print(m, file=sys.stderr, flush=True)
@@ -59,32 +62,6 @@ def persist_auth(d):
     d["saved_at"] = datetime.now(timezone.utc).isoformat()
     MINIMAX_AUTH_FILE.write_text(json.dumps(d, indent=2))
 
-def extract_cookies_cross_platform(domain_hint: str) -> dict:
-    """Extract cookies using browser_cookie3 (cross-platform), with WSL Firefox fallback."""
-    # First try browser_cookie3 (works on all platforms)
-    try:
-        import browser_cookie3
-        for name, fetch_fn in [("chrome", browser_cookie3.chrome), ("firefox", browser_cookie3.firefox),
-                                ("edge", browser_cookie3.edge), ("chromium", browser_cookie3.chromium)]:
-            try:
-                cj = fetch_fn(domain_name=domain_hint)
-                cookies = {c.name: c.value for c in cj}
-                if cookies:
-                    info(f"Extracted {len(cookies)} cookies from {name}")
-                    return cookies
-            except Exception:
-                continue
-    except ImportError:
-        pass
-    
-    # Fallback: WSL Firefox SQLite extraction
-    result = extract_firefox_cookies()
-    if result:
-        return result
-    
-    return {}
-
-
 def get_auth():
     cs = os.environ.get("MINIMAX_COOKIE")
     if cs: return {"cookies": {k: v for p in cs.split("; ") if "=" in p for k, _, v in [p.partition("=")]}}
@@ -93,10 +70,12 @@ def get_auth():
             d = json.loads(MINIMAX_AUTH_FILE.read_text())
             if d.get("cookies"): return d
         except: pass
-    ck = extract_cookies_cross_platform("minimax.io")
+    ck = extract_firefox_cookies()
     if ck:
+        # Save only essential auth cookies to keep file small
+        essential = {k: v for k, v in ck.items() if k in ("_token", "_sid", "ak_bmsc")}
         d = {"cookies": ck}; persist_auth(d); return d
-    fail("no-auth", "No MiniMax cookies found. Log into https://agent.minimax.io in your browser first.")
+    fail("no-auth", "No MiniMax cookies found. Log into https://agent.minimax.io in Windows Firefox first.")
 
 def browser_login():
     from playwright.sync_api import sync_playwright
@@ -245,7 +224,7 @@ def send_prompt(pg, prompt, model=MINIMAX_DEFAULT_MODEL, thinking=True, conv_url
         # Try textarea fallback
         editor = pg.locator("textarea").first
     if editor.count() == 0 or not editor.is_visible(timeout=8000):
-        fail("no-input", "Chat editor not found. Auth may be expired — try --login.")
+        raise MinimaxError("no-input", "Chat editor not found. Auth may be expired — try --login.")
     
     if debug: info(f"Sending ({len(prompt)} chars)")
     
@@ -265,9 +244,9 @@ def send_prompt(pg, prompt, model=MINIMAX_DEFAULT_MODEL, thinking=True, conv_url
     while time.time() < deadline:
         try:
             e = pg.evaluate(ERROR_JS)
-            if e=="auth-expired": fail("auth-expired","Auth expired. Re-login with --login.")
-            elif e=="error": fail("minimax-error","MiniMax returned an error.")
-            elif e=="rate-limit": fail("rate-limit","Rate limited.")
+            if e=="auth-expired": raise MinimaxError("auth-expired","Auth expired. Re-login with --login.")
+            elif e=="error": raise MinimaxError("minimax-error","MiniMax returned an error.")
+            elif e=="rate-limit": raise MinimaxError("rate-limit","Rate limited.")
         except: pass
         try: done = pg.evaluate(DONE_JS)
         except: done = False
@@ -306,23 +285,42 @@ def main():
     conv_url = conv.get("url") if not args.new else None
 
     auth = get_auth()
+    br = ctx = pg = None
     try:
         from playwright.sync_api import sync_playwright
-        with sync_playwright() as pw:
-            br = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-gpu"])
+        pw = sync_playwright().start()
+        try:
+            br = pw.chromium.launch(headless=True,
+                args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"])
             ctx = br.new_context(viewport={"width":1280,"height":800})
             setup_cookies(ctx, auth)
             pg = ctx.pages[0] if ctx.pages else ctx.new_page()
-            text, url = send_prompt(pg, prompt, model=model, thinking=thinking, conv_url=conv_url, debug=args.debug)
-            ctx.close(); br.close()
-            if not text: fail("empty-response","No response.")
-            log("[MINIMAX:DONE]")
-            if args.conversation: conv["url"]=url; conv["model"]=model; save_conv(args.conversation, conv)
-            if args.output:
-                op = Path(args.output); op.write_text(text, encoding="utf-8")
-                print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2},ensure_ascii=False))
-            elif args.json: print(json.dumps({"ok":True,"text":text,"url":url,"model":model}, ensure_ascii=False))
-            else: print(text)
+            text, url = send_prompt(pg, prompt, model=model, thinking=thinking,
+                                    conv_url=conv_url, debug=args.debug)
+        finally:
+            if pg: 
+                try: pg.close()
+                except: pass
+            if ctx: 
+                try: ctx.close()
+                except: pass
+            if br: 
+                try: br.close()
+                except: pass
+            try: pw.stop()
+            except: pass
+        
+        if not text: raise MinimaxError("empty-response","No response.")
+        log("[MINIMAX:DONE]")
+        if args.conversation: conv["url"]=url; conv["model"]=model; save_conv(args.conversation, conv)
+        if args.output:
+            op = Path(args.output); op.write_text(text, encoding="utf-8")
+            print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2},ensure_ascii=False))
+        elif args.json: print(json.dumps({"ok":True,"text":text,"url":url,"model":model}, ensure_ascii=False))
+        else: print(text)
+    except MinimaxError as e:
+        print(json.dumps({"ok":False,"err":e.code,"msg":e.msg},ensure_ascii=False))
+        sys.exit(1)
     except SystemExit: raise
     except Exception as e: fail("error", str(e))
 
