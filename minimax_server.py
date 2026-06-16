@@ -132,6 +132,7 @@ def cleanup():
 
 
 class QueryHandler(BaseHTTPRequestHandler):
+    allow_reuse_address = True
     def do_POST(self):
         if self.path != "/query":
             self.send_error(404)
