@@ -22,6 +22,41 @@ MINIMAX_DEFAULT_MODEL = "MiniMax-M3"
 
 _Q = False
 
+# Fast server path
+_MINIMAX_SERVER_PORT = 9871
+_MINIMAX_PID_FILE = MINIMAX_HOME / "server.pid"
+
+def _server_running() -> bool:
+    """Check if minimax_server.py is running."""
+    if not _MINIMAX_PID_FILE.exists():
+        return False
+    try:
+        pid = int(_MINIMAX_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        import urllib.request
+        urllib.request.urlopen(f"http://127.0.0.1:{_MINIMAX_SERVER_PORT}/health", timeout=1)
+        return True
+    except Exception:
+        return False
+
+def _try_server_query(prompt: str) -> dict | None:
+    """Try to query via running server. Returns response dict or None if unavailable."""
+    if not _server_running():
+        return None
+    try:
+        import urllib.request
+        data = json.dumps({"prompt": prompt}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{_MINIMAX_SERVER_PORT}/query",
+            data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            if result.get("ok"):
+                return result
+    except Exception:
+        pass
+    return None
+
 class MinimaxError(Exception):
     def __init__(self, code, msg):
         self.code = code; self.msg = msg; super().__init__(msg)
@@ -209,37 +244,42 @@ def toggle_thinking(pg, thinking: bool):
 
 def send_prompt(pg, prompt, model=MINIMAX_DEFAULT_MODEL, thinking=True, conv_url=None, debug=False):
     log("[MINIMAX:LOADING]")
+    
+    # Block slow resources for faster page load
+    _block_slow(pg)
+    
     if conv_url:
         pg.goto(conv_url, wait_until="domcontentloaded", timeout=30000)
     else:
         pg.goto(MINIMAX_BASE_URL, wait_until="domcontentloaded", timeout=30000)
-    time.sleep(6)  # Wait for React hydration + auth check
-    dismiss_modals(pg); time.sleep(2)
-    switch_model(pg, model); time.sleep(1)
+    
+    # Smart wait: wait for editor instead of fixed sleep(6)
+    try:
+        pg.wait_for_selector('.ProseMirror', timeout=10000)
+    except Exception:
+        time.sleep(4)  # Fallback if selector not found
+    
+    dismiss_modals(pg); time.sleep(0.5)
+    
+    # Only switch model if not default
+    if model != MINIMAX_DEFAULT_MODEL or "Thinking" in model:
+        switch_model(pg, model); time.sleep(0.5)
 
-    # MiniMax uses TipTap ProseMirror editor — keyboard.type() works
-    # Focus the editor first
+    # MiniMax uses TipTap ProseMirror editor
     editor = pg.locator('.ProseMirror').first
     if editor.count() == 0:
-        # Try textarea fallback
         editor = pg.locator("textarea").first
     if editor.count() == 0 or not editor.is_visible(timeout=8000):
         raise MinimaxError("no-input", "Chat editor not found. Auth may be expired — try --login.")
     
     if debug: info(f"Sending ({len(prompt)} chars)")
     
-    # Focus and type
-    editor.click(); time.sleep(0.3)
-    pg.keyboard.type(prompt, delay=20); time.sleep(0.5)
-    pg.keyboard.press("Enter"); time.sleep(1)
+    # Focus and type (ProseMirror needs keyboard events, but low delay)
+    editor.click(); time.sleep(0.1)
+    pg.keyboard.type(prompt, delay=5); time.sleep(0.2)
+    pg.keyboard.press("Enter")
 
-    # Some UIs need explicit send
-    try:
-        sb = pg.locator('button:has-text("Send"):not([disabled])').first
-        if sb.count()>0 and sb.is_visible(timeout=1000): sb.click(); time.sleep(0.5)
-    except: pass
-
-    # Poll for response
+    # Poll for response (0.3s intervals — faster than 0.5s)
     text = ""; deadline = time.time() + 300
     while time.time() < deadline:
         try:
@@ -247,15 +287,29 @@ def send_prompt(pg, prompt, model=MINIMAX_DEFAULT_MODEL, thinking=True, conv_url
             if e=="auth-expired": raise MinimaxError("auth-expired","Auth expired. Re-login with --login.")
             elif e=="error": raise MinimaxError("minimax-error","MiniMax returned an error.")
             elif e=="rate-limit": raise MinimaxError("rate-limit","Rate limited.")
-        except: pass
+        except MinimaxError: raise
+        except Exception: pass
         try: done = pg.evaluate(DONE_JS)
-        except: done = False
+        except Exception: done = False
         if done:
             try: text = pg.evaluate(EXTRACT_JS)
-            except: pass
+            except Exception: pass
             if text and len(text) > 2: break
-        time.sleep(0.5)
+        time.sleep(0.3)
     return text, pg.url
+
+
+def _block_slow(pg):
+    """Block images, fonts, media for faster page load."""
+    try:
+        def _abort_slow(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                route.abort()
+            else:
+                route.continue_()
+        pg.route("**/*", _abort_slow)
+    except Exception:
+        pass
 
 # ── main ─────────────────────────────────────────────────
 
@@ -285,6 +339,22 @@ def main():
     conv_url = conv.get("url") if not args.new else None
 
     auth = get_auth()
+
+    # Fast path: use running minimax_server.py if available
+    result = _try_server_query(prompt)
+    if result:
+        text = result.get("text", "")
+        if not text: raise MinimaxError("empty-response", "No response from server.")
+        log("[MINIMAX:DONE]")
+        if args.conversation:
+            save_conv(args.conversation, conv)
+        if args.output:
+            op = Path(args.output); op.write_text(text, encoding="utf-8")
+            print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2}, ensure_ascii=False))
+        elif args.json: print(json.dumps({"ok":True,"text":text,"model":model}, ensure_ascii=False))
+        else: print(text)
+        return
+
     br = ctx = pg = None
     try:
         from playwright.sync_api import sync_playwright
