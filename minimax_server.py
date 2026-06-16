@@ -66,8 +66,19 @@ def init_browser():
     setup_cookies(_ctx, auth)
     _pg = _ctx.pages[0] if _ctx.pages else _ctx.new_page()
 
+    # Block slow resources for faster page load
+    try:
+        def _abort(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                route.abort()
+            else:
+                route.continue_()
+        _pg.route("**/*", _abort)
+    except Exception: pass
+
     _pg.goto(MINIMAX_URL, timeout=30000)
-    time.sleep(4)  # SPA hydration
+    try: _pg.wait_for_selector('.ProseMirror', timeout=10000)
+    except: time.sleep(3)
 
     # Dismiss modals
     for txt in ["Close", "Try it now", "Accept", "Got it"]:

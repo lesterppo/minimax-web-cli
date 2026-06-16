@@ -40,9 +40,30 @@ def _server_running() -> bool:
         return False
 
 def _try_server_query(prompt: str) -> dict | None:
-    """Try to query via running server. Returns response dict or None if unavailable."""
+    """Try to query via running server. Auto-launches if not running."""
     if not _server_running():
-        return None
+        # Auto-launch the server on demand
+        from pathlib import Path
+        server_script = Path(__file__).resolve().parent / "minimax_server.py"
+        if not server_script.exists():
+            return None
+        import subprocess
+        log_path = Path.home() / ".chrome-daemon" / "minimax_server.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(
+            [sys.executable, str(server_script)],
+            stdout=open(log_path, "a"), stderr=open(log_path, "a"),
+            start_new_session=True,
+        )
+        # Wait for server to be ready (up to 30s)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if _server_running():
+                break
+            time.sleep(0.5)
+        if not _server_running():
+            return None  # Failed to start, fall through to direct Playwright
+    
     try:
         import urllib.request
         data = json.dumps({"prompt": prompt}).encode()
