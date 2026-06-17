@@ -169,23 +169,29 @@ def save_conv(p, s):
 # MiniMax uses TipTap rich text editor. Response appears as rendered HTML.
 EXTRACT_JS = """
 () => {
-    // MiniMax: assistant response text is in .matrix-markdown.message-content
-    // These appear after the user's message, one per assistant response
+    // MiniMax: assistant response text appears in .matrix-markdown.message-content
+    // elements. Skip user messages (parent has justify-end class) and thought-process
+    // blurbs. Take the longest non-user non-thought text.
     const contentEls = document.querySelectorAll('.matrix-markdown.message-content');
-    if (contentEls.length > 0) {
-        // Get the last one (most recent assistant response)
-        const text = contentEls[contentEls.length - 1].innerText?.trim();
-        if (text && text.length > 0) return text;
+    let best = '';
+    for (const el of contentEls) {
+        // Skip user messages (parent has justify-end class)
+        const parent = el.parentElement;
+        if (parent && (parent.className.includes('justify-end') || parent.className.includes('justify-end'))) continue;
+        const text = el.innerText?.trim() || '';
+        // Skip thought-process blurbs (short and start with "Thought")
+        if (text.startsWith('Thought') && text.length < 200) continue;
+        if (text.length > best.length) best = text;
     }
-    // Fallback: message-animate-in that contains the response
+    if (best) return best;
+    
+    // Fallback: .message-animate-in elements
     const msgEls = document.querySelectorAll('.message-animate-in');
     for (let i = msgEls.length - 1; i >= 0; i--) {
         const el = msgEls[i];
-        // Skip if it contains the user prompt (user messages have justify-end parent)
         const parent = el.parentElement;
         if (parent && parent.className.includes('justify-end')) continue;
         const text = el.innerText?.trim();
-        // Skip "Thought N time(s)" entries
         if (text && !text.startsWith('Thought') && text.length > 1) {
             return text.split('\\n').filter(l => !l.match(/^\\d{2}:\\d{2}$/)).join('\\n').trim();
         }
@@ -300,8 +306,9 @@ def send_prompt(pg, prompt, model=MINIMAX_DEFAULT_MODEL, thinking=True, conv_url
     pg.keyboard.type(prompt, delay=5); time.sleep(0.2)
     pg.keyboard.press("Enter")
 
-    # Poll for response (0.3s intervals — faster than 0.5s)
+    # Poll for response (0.3s intervals)
     text = ""; deadline = time.time() + 300
+    done_at = None  # timestamp when DONE was first detected
     while time.time() < deadline:
         try:
             e = pg.evaluate(ERROR_JS)
@@ -313,9 +320,16 @@ def send_prompt(pg, prompt, model=MINIMAX_DEFAULT_MODEL, thinking=True, conv_url
         try: done = pg.evaluate(DONE_JS)
         except Exception: done = False
         if done:
+            if done_at is None:
+                done_at = time.time()
             try: text = pg.evaluate(EXTRACT_JS)
             except Exception: pass
-            if text and len(text) > 2: break
+            # After DONE first fires, wait at least 6s for MiniMax's slow
+            # streaming to finish rendering into the DOM, then extract.
+            if text and len(text) > 30 and (time.time() - done_at) >= 10:
+                break
+        else:
+            done_at = None
         time.sleep(0.3)
     return text, pg.url
 

@@ -114,15 +114,37 @@ def send_query(prompt: str) -> str:
     time.sleep(0.2)
     _pg.keyboard.press("Enter")
 
-    # Wait for response
+    # Wait for response — MiniMax shows user message first, then assistant response.
+    # We need to wait for the SECOND new message-content element (the assistant's).
     prev_count = _pg.locator('.matrix-markdown.message-content').count()
     deadline = time.time() + 120
+    done_at = None
+    assistant_text = ""
     while time.time() < deadline:
         content_els = _pg.locator('.matrix-markdown.message-content')
         loading = _pg.locator('[class*="loading"]')
-        if content_els.count() > prev_count and loading.count() == 0:
-            time.sleep(0.3)
-            return content_els.last.inner_text().strip()
+        new_count = content_els.count()
+        
+        # Need at least 2 new elements: user message + assistant response
+        if new_count >= prev_count + 2 and loading.count() == 0:
+            if done_at is None:
+                done_at = time.time()
+            # Get text from ALL content elements, skip the user message (matches prompt)
+            # and skip thought-process snippets. Take the longest remaining text.
+            candidates = []
+            for i in range(new_count):
+                el = content_els.nth(i)
+                text = el.inner_text().strip() if el else ""
+                # Skip user message (matches our prompt) and thought snippets
+                if text and len(text) > 30 and prompt[:30] not in text[:100]:
+                    candidates.append(text)
+            if candidates:
+                candidates.sort(key=len, reverse=True)
+                current = candidates[0]
+                if (time.time() - done_at) >= 10:
+                    return current
+        elif new_count < prev_count + 2:
+            done_at = None
         time.sleep(0.3)
 
     return ""
